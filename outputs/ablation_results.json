@@ -1,0 +1,50 @@
+[
+  {
+    "variant": "True baseline (BCE, no CLAHE, no aug)",
+    "macro_auc": 0.7705,
+    "macro_f1": 0.0818,
+    "macro_precision": 0.2257,
+    "macro_recall": 0.0573,
+    "best_val_auc": 0.7935
+  },
+  {
+    "variant": "Baseline + focal loss",
+    "macro_auc": 0.7707,
+    "macro_f1": 0.0658,
+    "macro_precision": 0.1713,
+    "macro_recall": 0.0429,
+    "best_val_auc": 0.7888
+  },
+  {
+    "variant": "Baseline + CLAHE",
+    "macro_auc": 0.7599,
+    "macro_f1": 0.0754,
+    "macro_precision": 0.225,
+    "macro_recall": 0.0477,
+    "best_val_auc": 0.7771
+  },
+  {
+    "variant": "Baseline + augmentation",
+    "macro_auc": 0.8049,
+    "macro_f1": 0.1289,
+    "macro_precision": 0.3233,
+    "macro_recall": 0.0902,
+    "best_val_auc": 0.813
+  },
+  {
+    "variant": "Full pipeline (focal+CLAHE+aug) @ 0.5",
+    "macro_auc": 0.7904,
+    "macro_f1": 0.108,
+    "macro_precision": 0.252,
+    "macro_recall": 0.0764,
+    "best_val_auc": 0.7912
+  },
+  {
+    "variant": "Full pipeline + optimized thresholds",
+    "macro_auc": 0.7904,
+    "macro_f1": 0.1927,
+    "macro_precision": 0.2346,
+    "macro_recall": 0.1938,
+    "best_val_auc": 0.7912
+  }
+]

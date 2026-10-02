@@ -1,0 +1,15 @@
+torch>=2.1
+torchvision
+timm
+opencv-python
+albumentations
+scikit-learn
+pandas
+numpy
+matplotlib
+grad-cam
+einops
+fpdf2
+pyyaml
+tqdm
+gradio

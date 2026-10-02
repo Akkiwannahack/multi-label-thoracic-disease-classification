@@ -1,0 +1,11 @@
+__pycache__/
+backup_30k/
+checkpoints/
+*.parquet
+*.pth
+*.pt
+*.ckpt
+*.onnx
+.env
+.ipynb_checkpoints/
+

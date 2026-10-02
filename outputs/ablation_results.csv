@@ -1,0 +1,7 @@
+variant,macro_auc,macro_f1,macro_precision,macro_recall,best_val_auc
+"True baseline (BCE, no CLAHE, no aug)",0.7705,0.0818,0.2257,0.0573,0.7935
+Baseline + focal loss,0.7707,0.0658,0.1713,0.0429,0.7888
+Baseline + CLAHE,0.7599,0.0754,0.225,0.0477,0.7771
+Baseline + augmentation,0.8049,0.1289,0.3233,0.0902,0.813
+Full pipeline (focal+CLAHE+aug) @ 0.5,0.7904,0.108,0.252,0.0764,0.7912
+Full pipeline + optimized thresholds,0.7904,0.1927,0.2346,0.1938,0.7912

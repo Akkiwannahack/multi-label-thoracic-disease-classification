@@ -1,0 +1,86 @@
+{
+  "Atelectasis": {
+    "positive_count": 7405,
+    "total_count": 77994,
+    "positive_frequency": 0.094943,
+    "inverse_frequency_weight": 10.5326
+  },
+  "Cardiomegaly": {
+    "positive_count": 1549,
+    "total_count": 77994,
+    "positive_frequency": 0.019861,
+    "inverse_frequency_weight": 50.3512
+  },
+  "Effusion": {
+    "positive_count": 7852,
+    "total_count": 77994,
+    "positive_frequency": 0.100674,
+    "inverse_frequency_weight": 9.933
+  },
+  "Infiltration": {
+    "positive_count": 12480,
+    "total_count": 77994,
+    "positive_frequency": 0.160012,
+    "inverse_frequency_weight": 6.2495
+  },
+  "Mass": {
+    "positive_count": 3646,
+    "total_count": 77994,
+    "positive_frequency": 0.046747,
+    "inverse_frequency_weight": 21.3917
+  },
+  "Nodule": {
+    "positive_count": 4247,
+    "total_count": 77994,
+    "positive_frequency": 0.054453,
+    "inverse_frequency_weight": 18.3645
+  },
+  "Pneumonia": {
+    "positive_count": 783,
+    "total_count": 77994,
+    "positive_frequency": 0.010039,
+    "inverse_frequency_weight": 99.6092
+  },
+  "Pneumothorax": {
+    "positive_count": 2394,
+    "total_count": 77994,
+    "positive_frequency": 0.030695,
+    "inverse_frequency_weight": 32.5789
+  },
+  "Consolidation": {
+    "positive_count": 2584,
+    "total_count": 77994,
+    "positive_frequency": 0.033131,
+    "inverse_frequency_weight": 30.1834
+  },
+  "Edema": {
+    "positive_count": 1253,
+    "total_count": 77994,
+    "positive_frequency": 0.016065,
+    "inverse_frequency_weight": 62.2458
+  },
+  "Emphysema": {
+    "positive_count": 1317,
+    "total_count": 77994,
+    "positive_frequency": 0.016886,
+    "inverse_frequency_weight": 59.221
+  },
+  "Fibrosis": {
+    "positive_count": 1111,
+    "total_count": 77994,
+    "positive_frequency": 0.014245,
+    "inverse_frequency_weight": 70.2016
+  },
+  "Pleural_Thickening": {
+    "positive_count": 1997,
+    "total_count": 77994,
+    "positive_frequency": 0.025605,
+    "inverse_frequency_weight": 39.0556
+  },
+  "Hernia": {
+    "positive_count": 122,
+    "total_count": 77994,
+    "positive_frequency": 0.001564,
+    "inverse_frequency_weight": 639.2951
+  }
+}
