@@ -9,3 +9,5 @@ checkpoints/
 .env
 .ipynb_checkpoints/
 
+
+outputs/cache/
