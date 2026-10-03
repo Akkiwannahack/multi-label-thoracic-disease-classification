@@ -211,7 +211,7 @@ def smoke_test():
     assert ckpt["model_provenance"]["residual_fusion"] == "mean_v2"
     assert "rng_states" in ckpt, "Missing rng_states in checkpoint"
     assert ckpt["phase"] == 1, f"Expected phase 1, got {ckpt['phase']}"
-    print(f"[smoke] Checkpoint roundtrip: ✓ provenance, ✓ rng_states, ✓ phase")
+    print(f"[smoke] Checkpoint roundtrip: OK provenance, OK rng_states, OK phase")
 
     # Verify identical predictions
     model.eval()
@@ -223,7 +223,7 @@ def smoke_test():
     max_diff = (out1 - out2).abs().max().item()
     print(f"[smoke] Prediction diff after reload: {max_diff:.2e}")
     assert max_diff < 1e-5, f"Checkpoint reload changed predictions: diff={max_diff}"
-    print(f"[smoke] Checkpoint roundtrip: ✓ identical predictions")
+    print(f"[smoke] Checkpoint roundtrip: OK identical predictions")
 
     # Cleanup
     os.remove(ckpt_path)
