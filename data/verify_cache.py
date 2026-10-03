@@ -2,6 +2,8 @@
 verify_cache.py — Verify that the cached path produces identical tensors
 to the original imread + enhance path (with augmentation disabled).
 
+Fix G: uses shared get_enhancement_kwargs, handles parquet manifests.
+
 Usage:
     python -m data.verify_cache --config configs/base.yaml
 """
@@ -16,24 +18,13 @@ import pandas as pd
 import torch
 import yaml
 
-from data.enhancement import enhance_image
+from data.enhancement import enhance_image, get_enhancement_kwargs
 from data.augmentation import get_val_augmentation
 
 
 def verify(cfg: dict, n_samples: int = 20) -> bool:
-    enh = cfg["enhancement"]
-    image_size = enh["image_size"]
-    enh_kwargs = dict(
-        image_size=image_size,
-        clahe_clip=enh["clahe_clip_limit"],
-        clahe_tile=tuple(enh["clahe_tile_grid"]),
-        bilateral_d=enh["bilateral_d"],
-        bilateral_sc=enh["bilateral_sigma_color"],
-        bilateral_ss=enh["bilateral_sigma_space"],
-        sharpen_amount=enh["sharpen_amount"],
-        imagenet_mean=tuple(enh["imagenet_mean"]),
-        imagenet_std=tuple(enh["imagenet_std"]),
-    )
+    enh_kwargs = get_enhancement_kwargs(cfg)
+    image_size = enh_kwargs["image_size"]
 
     # Load cache
     cache_dir = os.path.join(cfg["paths"]["output_dir"], "cache")
@@ -50,10 +41,18 @@ def verify(cfg: dict, n_samples: int = 20) -> bool:
     mmap = np.memmap(mmap_path, dtype=np.uint8, mode="r",
                      shape=(n_rows, image_size, image_size))
 
-    # Pick random training images
+    # Pick random training images (prefer parquet, fall back to csv)
     manifest_dir = cfg["paths"]["manifest_dir"]
+    train_parquet = os.path.join(manifest_dir, "manifest_train.parquet")
     train_csv = os.path.join(manifest_dir, "manifest_train.csv")
-    df = pd.read_csv(train_csv)
+    if os.path.isfile(train_parquet):
+        df = pd.read_parquet(train_parquet)
+    elif os.path.isfile(train_csv):
+        df = pd.read_csv(train_csv)
+    else:
+        print("[verify] No training manifest found.")
+        return False
+
     sample_rows = df.sample(n=min(n_samples, len(df)), random_state=42)
 
     # Validation augmentation only (no random transforms)

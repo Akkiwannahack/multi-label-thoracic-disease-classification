@@ -1,0 +1,157 @@
+# ============================================================
+# Recipe L1 — BCE with positive-term weighting
+# ============================================================
+# Uniform shuffle, BCE with pos_weight sqrt(N_neg/N_pos),
+# mild augmentation, mean_v2 fusion, frozen backbone BN.
+# This is the first clean run with all audit fixes applied.
+
+experiment:
+  run_id: L1_bce_posweight_seed42
+  seed: 42
+  model_type: hybrid_resnet_mamba
+
+dataset:
+  root_dir: "E:/PBL V/data/raw"
+  csv_file: "Data_Entry_2017.csv"
+  bbox_csv: "BBox_List_2017.csv"
+  train_val_list: "train_val_list.txt"
+  test_list: "test_list.txt"
+  image_dirs:
+    - "images_001/images"
+    - "images_002/images"
+    - "images_003/images"
+    - "images_004/images"
+    - "images_005/images"
+    - "images_006/images"
+    - "images_007/images"
+    - "images_008/images"
+    - "images_009/images"
+    - "images_010/images"
+    - "images_011/images"
+    - "images_012/images"
+  val_fraction: 0.1
+  num_classes: 14
+  use_cache: false          # raw resize — no cache needed
+  class_names:
+    - "Atelectasis"
+    - "Cardiomegaly"
+    - "Effusion"
+    - "Infiltration"
+    - "Mass"
+    - "Nodule"
+    - "Pneumonia"
+    - "Pneumothorax"
+    - "Consolidation"
+    - "Edema"
+    - "Emphysema"
+    - "Fibrosis"
+    - "Pleural_Thickening"
+    - "Hernia"
+
+data_policy:
+  manifest_format: csv
+  sampler: uniform
+  drop_last_train: false
+
+enhancement:
+  image_size: 224
+  clahe_clip_limit: 2.0
+  clahe_tile_grid: [8, 8]
+  bilateral_d: 5
+  bilateral_sigma_color: 50
+  bilateral_sigma_space: 50
+  sharpen_amount: 1.0
+  imagenet_mean: [0.485, 0.456, 0.406]
+  imagenet_std:  [0.229, 0.224, 0.225]
+  # Raw resize — all enhancement OFF
+  clahe_enabled: false
+  bilateral_enabled: false
+  unsharp_enabled: false
+
+augmentation:
+  horizontal_flip_p: 0.5
+  rotation_limit: 10
+  brightness_limit: 0.15
+  contrast_limit: 0.15
+  shift_limit: 0.08
+  scale_limit: 0.10
+  # Mild augmentation — extra modules OFF
+  noise_enabled: false
+  grid_distortion_enabled: false
+  coarse_dropout_enabled: false
+
+model:
+  backbone: "resnet50"
+  resnet_out_channels: 2048
+  mamba_d_model: 512
+  mamba_d_state: 16
+  mamba_num_blocks: 6
+  mamba_bidirectional: true
+  fusion_hidden: 768
+  dropout: 0.3
+  num_classes: 14
+  residual_fusion: "mean_v2"
+  mamba_backend: "custom_pytorch"
+
+training:
+  loss: "bce"
+  class_weighting: none
+  positive_weighting: sqrt_ratio
+  label_smoothing: 0.0
+  max_class_weight: 30.0
+  max_pos_weight: 5.0
+
+  batch_size: 8
+  accumulation_steps: 4      # effective batch = 32
+  num_workers: 4
+  epochs: 10
+  mixed_precision: true
+
+  frozen_backbone_epochs: 2
+  fine_tune_layers: ["layer4"]
+  freeze_backbone_bn_stats: true
+  min_finetune_epochs: 2
+
+  lr_backbone: 1.0e-5
+  lr_head: 1.0e-4
+  weight_decay: 1.0e-4
+  early_stopping_patience: 3
+
+  scheduler: "plateau"
+  plateau_factor: 0.5
+  plateau_patience: 1
+  warmup_epochs_stage2: 2
+
+  # Legacy keys (unused by new code but kept for compatibility)
+  stage1_epochs: 2
+  lr_backbone_stage1: 1.0e-5
+  lr_head_stage1: 1.0e-4
+  lr_backbone_stage2: 1.0e-5
+  lr_head_stage2: 1.0e-4
+
+confidence:
+  mc_passes: 20
+  high_threshold: 0.05
+  medium_threshold: 0.12
+
+gradcam:
+  target_layer: "layer4"
+  alpha_blend: 0.4
+  heatmap_threshold_percentile: 80
+
+localization:
+  grid_rows: 3
+  grid_cols: 2
+  region_names:
+    - "Right Upper"
+    - "Left Upper"
+    - "Right Mid"
+    - "Left Mid"
+    - "Right Lower"
+    - "Left Lower"
+
+paths:
+  manifest_dir: "outputs"
+  checkpoint_dir: "runs/L1/checkpoints"
+  output_dir: "runs/L1/outputs"
+  report_dir: "runs/L1/outputs/reports"

@@ -1,14 +1,19 @@
 """
-optimize_thresholds.py — Step 1: Per-Class Threshold Optimization
+optimize_thresholds.py — Per-Class Threshold Optimization
 
-Loads the best checkpoint, runs inference on the VALIDATION set only,
-sweeps per-class thresholds to maximize each class's F1, then applies
-the locked thresholds to the TEST set for a before/after comparison.
+Loads a checkpoint, runs inference on the VALIDATION set only,
+sweeps per-class thresholds to maximize each class's F1, then
+optionally applies the locked thresholds to the TEST set.
 
-No retraining is performed.
+Fix H: --fit-only mode (must not instantiate test loader),
+       per-run output directory, checkpoint provenance validation.
 
 Usage (from thoracic-xray/):
-    python -m training.optimize_thresholds --config configs/base.yaml
+    python -m training.optimize_thresholds --config configs/base.yaml \\
+        --checkpoint checkpoints/best_model.pt
+
+    python -m training.optimize_thresholds --config configs/base.yaml \\
+        --checkpoint checkpoints/best_model.pt --fit-only
 """
 
 import argparse
@@ -28,11 +33,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from models.hybrid_model import build_model
+from models.baseline_resnet50 import build_baseline_model
 from data.dataset import ChestXrayDataset
-
-
-
-
 
 
 @torch.no_grad()
@@ -140,11 +142,19 @@ def evaluate_with_thresholds(probs, targets, class_names, thresholds):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Step 1: Per-class threshold optimization"
+        description="Per-class threshold optimization"
     )
     parser.add_argument("--config", type=str, default="configs/base.yaml")
     parser.add_argument(
         "--checkpoint", type=str, default="checkpoints/best_model.pt"
+    )
+    parser.add_argument(
+        "--fit-only", action="store_true",
+        help="Fix H: Only fit thresholds on val, do NOT touch test set"
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help="Per-run output directory (Fix H: avoids global file)"
     )
     args = parser.parse_args()
 
@@ -161,23 +171,49 @@ def main():
     class_names = cfg["dataset"]["class_names"]
 
     # --- Load model from checkpoint ---
-    model = build_model(cfg).to(device)
+    if not os.path.isfile(args.checkpoint):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {args.checkpoint}. "
+            "Cannot optimize thresholds without a trained model."
+        )
+
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+
+    # Fix H: detect model type and use correct factory
+    model_type = ckpt.get("model_type", "hybrid_resnet_mamba")
+    prov = ckpt.get("model_provenance", {})
+    if prov:
+        model_type = prov.get("model_type", model_type)
+
+    if model_type == "baseline_resnet50":
+        model = build_baseline_model(cfg).to(device)
+    else:
+        model = build_model(cfg).to(device)
+
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print(
-        f"[threshold] Loaded checkpoint from epoch {ckpt.get('epoch', '?')}, "
-        f"macro-AUC {ckpt.get('macro_auc', '?')}"
+        f"[threshold] Loaded {model_type} checkpoint from epoch {ckpt.get('epoch', '?')}, "
+        f"macro-AUC {ckpt.get('macro_auc', ckpt.get('best_macro_auc', '?'))}"
     )
 
-    # --- Build val and test datasets ---
+    # --- Determine output directory (Fix H: per-run) ---
+    output_dir = args.output_dir or cfg["paths"]["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --- Build val dataset ---
     manifest_dir = cfg["paths"]["manifest_dir"]
+
+    val_parquet = os.path.join(manifest_dir, "manifest_val.parquet")
     val_csv = os.path.join(manifest_dir, "manifest_val.csv")
-    test_csv = os.path.join(manifest_dir, "manifest_test.csv")
+    if os.path.isfile(val_parquet):
+        val_path = val_parquet
+    elif os.path.isfile(val_csv):
+        val_path = val_csv
+    else:
+        raise FileNotFoundError("No val manifest found")
 
-    val_ds = ChestXrayDataset(val_csv, cfg, split="val")
-
-    test_ds = ChestXrayDataset(test_csv, cfg, split="test")
+    val_ds = ChestXrayDataset(val_path, cfg, split="val")
 
     bs = cfg["training"]["batch_size"]
     nw = min(cfg["training"]["num_workers"], 2)  # conservative for Windows
@@ -186,13 +222,9 @@ def main():
         val_ds, batch_size=bs, shuffle=False,
         num_workers=nw, pin_memory=True,
     )
-    test_loader = DataLoader(
-        test_ds, batch_size=bs, shuffle=False,
-        num_workers=nw, pin_memory=True,
-    )
 
     # ===================================================================
-    # Step 1a: Collect VALIDATION predictions (threshold selection happens here)
+    # Step 1a: Collect VALIDATION predictions
     # ===================================================================
     print(f"\n[threshold] Running inference on VALIDATION set ({len(val_ds)} samples)...")
     val_probs, val_targets = collect_predictions(model, val_loader, device)
@@ -203,15 +235,37 @@ def main():
     optimal = optimize_thresholds_per_class(val_probs, val_targets, class_names)
 
     # Save thresholds
-    os.makedirs(cfg["paths"]["output_dir"], exist_ok=True)
-    thr_path = os.path.join(cfg["paths"]["output_dir"], "optimized_thresholds.json")
+    thr_path = os.path.join(output_dir, "optimized_thresholds.json")
     with open(thr_path, "w") as f:
         json.dump(optimal, f, indent=2)
     print(f"\n[threshold] Optimized thresholds saved -> {thr_path}")
 
     # ===================================================================
+    # Fix H: --fit-only stops here (never touches test data)
+    # ===================================================================
+    if args.fit_only:
+        print("[threshold] --fit-only mode: done. Test set was NOT used.")
+        return
+
+    # ===================================================================
     # Step 1c: Evaluate on TEST set with LOCKED thresholds from val
     # ===================================================================
+    test_parquet = os.path.join(manifest_dir, "manifest_test.parquet")
+    test_csv = os.path.join(manifest_dir, "manifest_test.csv")
+    if os.path.isfile(test_parquet):
+        test_path = test_parquet
+    elif os.path.isfile(test_csv):
+        test_path = test_csv
+    else:
+        print("[threshold] No test manifest found — skipping test evaluation.")
+        return
+
+    test_ds = ChestXrayDataset(test_path, cfg, split="test")
+    test_loader = DataLoader(
+        test_ds, batch_size=bs, shuffle=False,
+        num_workers=nw, pin_memory=True,
+    )
+
     print(f"\n[threshold] Running inference on TEST set ({len(test_ds)} samples)...")
     test_probs, test_targets = collect_predictions(model, test_loader, device)
 
@@ -261,7 +315,7 @@ def main():
         "thresholds": optimized_thresholds,
     }
     results_path = os.path.join(
-        cfg["paths"]["output_dir"], "threshold_comparison.json"
+        output_dir, "threshold_comparison.json"
     )
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)

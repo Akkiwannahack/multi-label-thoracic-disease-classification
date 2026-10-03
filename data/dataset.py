@@ -3,9 +3,14 @@ dataset.py — Phase 1: PyTorch Dataset + DataLoader factory
 
 Provides `ChestXrayDataset` and utility functions for building weighted
 samplers and DataLoaders from the manifests produced by build_manifest.py.
+
+Fix A: separate explicit sampler config (uniform / weighted_legacy).
+Fix G: shared enhancement kwargs via get_enhancement_kwargs(),
+       cache fingerprint validation.
 """
 
 import json
+import logging
 import os
 
 import cv2
@@ -15,11 +20,13 @@ import torch
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from data.augmentation import get_train_augmentation, get_val_augmentation
-from data.enhancement import enhance_image
+from data.enhancement import enhance_image, get_enhancement_kwargs, compute_preprocessing_fingerprint
+
+logger = logging.getLogger(__name__)
 
 
 class ChestXrayDataset(Dataset):
-    """Multi-label chest X-ray dataset backed by a manifest CSV.
+    """Multi-label chest X-ray dataset backed by a manifest CSV/Parquet.
 
     Each sample returns:
         image  — (3, H, W) float32 tensor (enhanced + optionally augmented)
@@ -40,18 +47,8 @@ class ChestXrayDataset(Dataset):
         self.split = split
         self.label_cols = [f"label_{i}" for i in range(cfg["dataset"]["num_classes"])]
 
-        enh = cfg["enhancement"]
-        self.enh_kwargs = dict(
-            image_size=enh["image_size"],
-            clahe_clip=enh["clahe_clip_limit"],
-            clahe_tile=tuple(enh["clahe_tile_grid"]),
-            bilateral_d=enh["bilateral_d"],
-            bilateral_sc=enh["bilateral_sigma_color"],
-            bilateral_ss=enh["bilateral_sigma_space"],
-            sharpen_amount=enh["sharpen_amount"],
-            imagenet_mean=tuple(enh["imagenet_mean"]),
-            imagenet_std=tuple(enh["imagenet_std"]),
-        )
+        # --- Fix G: shared enhancement kwargs ---
+        self.enh_kwargs = get_enhancement_kwargs(cfg)
 
         # --- Optional on-disk cache ---
         self.use_cache = cfg["dataset"].get("use_cache", False)
@@ -64,21 +61,52 @@ class ChestXrayDataset(Dataset):
             cache_dir = os.path.join(cfg["paths"]["output_dir"], "cache")
             mmap_path = os.path.join(cache_dir, "images.dat")
             index_path = os.path.join(cache_dir, "cache_index.csv")
+            meta_path = os.path.join(cache_dir, "cache_meta.json")
+
             if not os.path.isfile(mmap_path) or not os.path.isfile(index_path):
                 raise FileNotFoundError(
                     f"Cache files not found in {cache_dir}. "
                     f"Run: python -m data.build_cache --config <cfg>"
                 )
+
+            # --- Fix G: validate cache fingerprint ---
+            current_fp = compute_preprocessing_fingerprint(self.enh_kwargs)
+            if os.path.isfile(meta_path):
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                cached_fp = meta.get("fingerprint", "")
+                if cached_fp != current_fp:
+                    raise ValueError(
+                        f"Cache fingerprint mismatch: cached={cached_fp}, "
+                        f"current={current_fp}. Rebuild cache with new settings."
+                    )
+                allocated_rows = meta.get("allocated_rows", None)
+            else:
+                allocated_rows = None
+                logger.warning(
+                    "No cache_meta.json — cannot validate cache fingerprint."
+                )
+
             # Build path → row lookup
             idx_df = pd.read_csv(index_path)
             self._cache_lookup = dict(zip(idx_df["image_path"], idx_df["row"]))
+
             # Store path/shape for lazy open — do NOT create memmap here
             # because Windows spawns DataLoader workers via pickle, and a
             # memmap pickles as a full in-memory copy of the backing file.
-            image_size = enh["image_size"]
-            n_rows = len(idx_df)
+            image_size = self.enh_kwargs["image_size"]
+            n_rows = allocated_rows if allocated_rows is not None else len(idx_df)
             self._cache_path = mmap_path
             self._cache_shape = (n_rows, image_size, image_size)
+
+            # --- Fix G: file-size validation ---
+            expected_bytes = n_rows * image_size * image_size
+            actual_bytes = os.path.getsize(mmap_path)
+            if actual_bytes < expected_bytes:
+                raise ValueError(
+                    f"Cache file too small: expected at least {expected_bytes} bytes "
+                    f"for {n_rows} rows, got {actual_bytes}."
+                )
 
         aug_cfg = cfg["augmentation"]
         if split == "train":
@@ -89,6 +117,9 @@ class ChestXrayDataset(Dataset):
                 shift_limit=aug_cfg["shift_limit"],
                 scale_limit=aug_cfg["scale_limit"],
                 horizontal_flip_p=aug_cfg["horizontal_flip_p"],
+                noise_enabled=aug_cfg.get("noise_enabled", True),
+                grid_distortion_enabled=aug_cfg.get("grid_distortion_enabled", True),
+                coarse_dropout_enabled=aug_cfg.get("coarse_dropout_enabled", True),
             )
         else:
             self.augmentation = get_val_augmentation()
@@ -158,6 +189,8 @@ def make_weighted_sampler(
     Each sample's weight = max inverse-frequency weight across its positive labels.
     This up-weights batches containing rare diseases (e.g. Hernia) without
     duplicating patients (avoids leakage risk of naive oversampling).
+
+    Fix A: Changed from sum to max for per-sample weight aggregation.
     """
     if manifest_path.endswith('.parquet'):
         df = pd.read_parquet(manifest_path)
@@ -175,14 +208,14 @@ def make_weighted_sampler(
         class_weights.append(w)
     class_weights = np.array(class_weights, dtype=np.float32)
 
-    # Per-sample weight = max weight across its positive labels
+    # Per-sample weight = max weight across its positive labels (Fix A: changed from sum)
     labels_matrix = df[label_cols].values.astype(np.float32)   # (N, 14)
     # For samples with no positive label, use weight = 1.0
     sample_weights = np.ones(len(df), dtype=np.float32)
     for i in range(len(df)):
         pos_indices = np.where(labels_matrix[i] > 0)[0]
         if len(pos_indices) > 0:
-            sample_weights[i] = class_weights[pos_indices].sum()
+            sample_weights[i] = class_weights[pos_indices].max()
 
     return WeightedRandomSampler(
         weights=sample_weights.tolist(),
@@ -197,18 +230,23 @@ def build_dataloaders(
 ) -> dict[str, DataLoader]:
     """Build train/val/test DataLoaders from manifests + config.
 
-    Returns dict with keys 'train', 'val', 'test'.
+    Fix A: explicit sampler config via data_policy.sampler.
     """
     manifest_dir = manifest_dir or cfg["paths"]["manifest_dir"]
     bs = cfg["training"]["batch_size"]
     nw = cfg["training"]["num_workers"]
+
+    # --- Fix A: explicit sampler setting ---
+    data_policy = cfg.get("data_policy", {})
+    sampler_mode = data_policy.get("sampler", "auto")
+    drop_last_train = data_policy.get("drop_last_train", True)
 
     loaders = {}
 
     for split in ["train", "val", "test"]:
         parquet_path = os.path.join(manifest_dir, f"manifest_{split}.parquet")
         csv_path = os.path.join(manifest_dir, f"manifest_{split}.csv")
-        
+
         if os.path.isfile(parquet_path):
             manifest_path = parquet_path
         elif os.path.isfile(csv_path):
@@ -222,15 +260,41 @@ def build_dataloaders(
         sampler = None
         shuffle = False
         if split == "train":
-            balance_path = os.path.join(manifest_dir, "class_balance.json")
-            if os.path.isfile(balance_path):
-                sampler = make_weighted_sampler(
-                    manifest_path, balance_path,
-                    num_classes=cfg["dataset"]["num_classes"],
-                    max_weight=cfg["training"]["max_class_weight"],
-                )
+            if sampler_mode == "uniform":
+                # Fix A: uniform shuffle, no weighted sampler
+                shuffle = True
+                logger.info("Train sampler: uniform shuffle")
+            elif sampler_mode == "weighted_legacy":
+                balance_path = os.path.join(manifest_dir, "class_balance.json")
+                if os.path.isfile(balance_path):
+                    sampler = make_weighted_sampler(
+                        manifest_path, balance_path,
+                        num_classes=cfg["dataset"]["num_classes"],
+                        max_weight=cfg["training"].get("max_class_weight", 30.0),
+                    )
+                    logger.info("Train sampler: weighted_legacy")
+                else:
+                    shuffle = True
+                    logger.warning(
+                        "Weighted sampler requested but class_balance.json missing — "
+                        "falling back to uniform."
+                    )
+            elif sampler_mode == "auto":
+                # Legacy behaviour: use weighted if balance file exists
+                balance_path = os.path.join(manifest_dir, "class_balance.json")
+                if os.path.isfile(balance_path):
+                    sampler = make_weighted_sampler(
+                        manifest_path, balance_path,
+                        num_classes=cfg["dataset"]["num_classes"],
+                        max_weight=cfg["training"].get("max_class_weight", 30.0),
+                    )
+                else:
+                    shuffle = True  # fallback if balance file missing
             else:
-                shuffle = True  # fallback if balance file missing
+                raise ValueError(
+                    f"Unknown sampler mode '{sampler_mode}'. "
+                    f"Valid: 'uniform', 'weighted_legacy', 'auto'"
+                )
 
         loaders[split] = DataLoader(
             ds,
@@ -239,7 +303,7 @@ def build_dataloaders(
             sampler=sampler,
             num_workers=nw,
             pin_memory=True,
-            drop_last=(split == "train"),
+            drop_last=(split == "train" and drop_last_train),
         )
 
     return loaders

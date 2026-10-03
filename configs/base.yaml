@@ -1,6 +1,14 @@
 # ============================================================
 # Thoracic X-ray Classification — Base Configuration
 # ============================================================
+# This is the LEGACY config. For new runs, use the per-run
+# configs in configs/recipe_*.yaml which have all new keys.
+
+# --- Experiment (Fix D/F) -----------------------------------
+experiment:
+  run_id: legacy
+  seed: 42
+  model_type: hybrid_resnet_mamba
 
 # --- Dataset ------------------------------------------------
 dataset:
@@ -41,7 +49,13 @@ dataset:
     - "Pleural_Thickening"
     - "Hernia"
 
-# --- Image Enhancement -------------------------------------
+# --- Data Policy (Fix A) -----------------------------------
+data_policy:
+  manifest_format: csv
+  sampler: auto              # "uniform", "weighted_legacy", "auto"
+  drop_last_train: true
+
+# --- Image Enhancement (Fix G) -----------------------------
 enhancement:
   image_size: 224
   clahe_clip_limit: 2.0
@@ -52,6 +66,10 @@ enhancement:
   sharpen_amount: 1.0
   imagenet_mean: [0.485, 0.456, 0.406]
   imagenet_std:  [0.229, 0.224, 0.225]
+  # Fix G: independent booleans (legacy = all on)
+  clahe_enabled: true
+  bilateral_enabled: true
+  unsharp_enabled: true
 
 # --- Augmentation -------------------------------------------
 augmentation:
@@ -61,8 +79,12 @@ augmentation:
   contrast_limit: 0.1
   shift_limit: 0.05
   scale_limit: 0.05
+  # Fix G: conditional augmentation modules
+  noise_enabled: true
+  grid_distortion_enabled: true
+  coarse_dropout_enabled: true
 
-# --- Model --------------------------------------------------
+# --- Model (Fix C, D) --------------------------------------
 model:
   backbone: "resnet50"
   resnet_out_channels: 2048
@@ -73,31 +95,51 @@ model:
   fusion_hidden: 768
   dropout: 0.4
   num_classes: 14
+  # Fix C: residual fusion mode
+  residual_fusion: "mean_v2"       # "legacy_sum" | "mean_v2"
+  # Fix D: explicit backend
+  mamba_backend: "custom_pytorch"  # "custom_pytorch" | "mamba_ssm"
 
-# --- Training -----------------------------------------------
+# --- Training (Fix A, B, F) --------------------------------
 training:
-  loss: "asymmetric"         # "asymmetric", "focal", or "weighted_bce"
+  loss: "asymmetric"         # "bce", "asymmetric", "focal", "weighted_bce"
   focal_gamma: 2.0
   asl_gamma_neg: 4.0
   asl_gamma_pos: 1.0
   asl_clip: 0.05
   label_smoothing: 0.1
   max_class_weight: 30.0
+  # Fix A: separate weighting controls
+  class_weighting: auto      # "none" | "auto"
+  positive_weighting: none   # "none" | "sqrt_ratio"
+  max_pos_weight: 5.0
+
   batch_size: 16
   accumulation_steps: 4      # effective batch = 16 × 4 = 64
   num_workers: 4
   epochs: 20
-  early_stopping_patience: 5
   mixed_precision: true
 
-  # Staged fine-tuning
+  # Fix B: frozen backbone config
+  frozen_backbone_epochs: 5  # replaces stage1_epochs
+  fine_tune_layers: ["layer4"]
+  freeze_backbone_bn_stats: true
+  min_finetune_epochs: 2
+
+  # Legacy stage keys (kept for old callers)
   stage1_epochs: 5
   lr_backbone_stage1: 5.0e-5
   lr_head_stage1: 1.5e-4
   lr_backbone_stage2: 5.0e-6
   lr_head_stage2: 5.0e-5
   warmup_epochs_stage2: 3
+
+  # Fix B: new explicit LR keys
+  lr_backbone: 5.0e-6
+  lr_head: 5.0e-5
+
   weight_decay: 5.0e-4
+  early_stopping_patience: 5
 
   scheduler: "cosine_warm_restarts"
   cosine_T_0: 5

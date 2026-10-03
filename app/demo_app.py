@@ -4,12 +4,17 @@ demo_app.py — Phase 11: Gradio Demo Application
 Lightweight web interface for live demonstration:
     Upload X-ray → Enhanced image → Predictions → Grad-CAM++ → Confidence → PDF Report
 
+Fix H: Uses deterministic eval-mode probabilities with validation-fitted
+       thresholds. Loads full preprocessing config from checkpoint.
+       Raises clear error for missing/incompatible checkpoint.
+
 Usage:
-    python -m app.demo_app --config configs/base.yaml \
+    python -m app.demo_app --config configs/base.yaml \\
         --checkpoint checkpoints/best_model.pt
 """
 
 import argparse
+import json
 import os
 import tempfile
 
@@ -24,7 +29,7 @@ try:
 except ImportError:
     GRADIO_AVAILABLE = False
 
-from data.enhancement import enhance_image
+from data.enhancement import enhance_image, get_enhancement_kwargs
 from explainability.confidence import predict_with_confidence
 from explainability.gradcam_pp import generate_heatmap, overlay_heatmap
 from explainability.localization import localize
@@ -41,21 +46,54 @@ CLASS_NAMES = [
 
 
 def load_model(config_path: str, checkpoint_path: str, device: torch.device):
-    """Load config and model from checkpoint."""
+    """Load config and model from checkpoint.
+
+    Fix H: raises clear error for missing checkpoint instead of silently
+    predicting with random weights.
+    """
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
     model = build_model(cfg).to(device)
 
-    if os.path.isfile(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        print(f"[demo] Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
-    else:
-        print(f"[demo] WARNING: Checkpoint not found at {checkpoint_path} — using random weights!")
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found at {checkpoint_path}. "
+            "Cannot run demo without a trained model."
+        )
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    print(f"[demo] Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
 
     model.eval()
-    return model, cfg
+
+    # Fix H: load thresholds if available alongside checkpoint
+    thresholds = None
+    ckpt_dir = os.path.dirname(checkpoint_path)
+    output_dir = cfg["paths"]["output_dir"]
+
+    for thr_path in [
+        os.path.join(output_dir, "optimized_thresholds.json"),
+        os.path.join(ckpt_dir, "optimized_thresholds.json"),
+    ]:
+        if os.path.isfile(thr_path):
+            with open(thr_path, "r") as f:
+                thr_data = json.load(f)
+            thresholds = {}
+            for name in CLASS_NAMES:
+                if name in thr_data:
+                    val = thr_data[name]
+                    thresholds[name] = val["threshold"] if isinstance(val, dict) else val
+                else:
+                    thresholds[name] = 0.5
+            print(f"[demo] Loaded fitted thresholds from {thr_path}")
+            break
+
+    if thresholds is None:
+        print("[demo] No fitted thresholds found — using 0.5 for all classes")
+
+    return model, cfg, thresholds
 
 
 def process_xray(
@@ -63,13 +101,16 @@ def process_xray(
     model: torch.nn.Module,
     cfg: dict,
     device: torch.device,
+    thresholds: dict[str, float] | None = None,
 ) -> tuple:
     """Process a single X-ray image through the full pipeline.
+
+    Fix H: Uses full enhancement config from checkpoint. Uses fitted thresholds.
 
     Returns:
         (enhanced_image, predictions_table, heatmap_overlay, report_path)
     """
-    enh_cfg = cfg["enhancement"]
+    enh_kwargs = get_enhancement_kwargs(cfg)
     conf_cfg = cfg["confidence"]
     gc_cfg = cfg["gradcam"]
     loc_cfg = cfg["localization"]
@@ -82,15 +123,13 @@ def process_xray(
     else:
         gray = image
 
-    # Enhance
-    enhanced_rgb = enhance_image(gray, normalize=False,
-                                  image_size=enh_cfg["image_size"])
-    enhanced_norm = enhance_image(gray, normalize=True,
-                                   image_size=enh_cfg["image_size"])
+    # Enhance (using full config, not just image_size)
+    enhanced_rgb = enhance_image(gray, normalize=False, **enh_kwargs)
+    enhanced_norm = enhance_image(gray, normalize=True, **enh_kwargs)
 
     image_tensor = torch.from_numpy(enhanced_norm).permute(2, 0, 1).float()
 
-    # Predict
+    # Predict (Fix H: uses fitted thresholds and deterministic mode)
     result = predict_with_confidence(
         model, image_tensor,
         class_names=CLASS_NAMES,
@@ -98,6 +137,7 @@ def process_xray(
         high_threshold=conf_cfg["high_threshold"],
         medium_threshold=conf_cfg["medium_threshold"],
         device=device,
+        thresholds=thresholds,
     )
 
     # Build predictions table
@@ -148,6 +188,7 @@ def process_xray(
         generate_report(
             tmp_img_path, model, cfg, report_path,
             patient_id="Demo", device=device,
+            thresholds=thresholds,
         )
     except Exception as e:
         print(f"[demo] Report generation failed: {e}")
@@ -158,17 +199,21 @@ def process_xray(
     return enhanced_rgb, table_rows, heatmap_overlay, report_path
 
 
-def create_app(model, cfg, device):
+def create_app(model, cfg, device, thresholds=None):
     """Create the Gradio interface."""
 
     def predict(image):
         if image is None:
             return None, [], None, None
 
-        enhanced, table, overlay, report = process_xray(image, model, cfg, device)
+        enhanced, table, overlay, report = process_xray(
+            image, model, cfg, device, thresholds
+        )
 
         headers = ["Disease", "Probability", "Confidence", "Location"]
         return enhanced, {"headers": headers, "data": table}, overlay, report
+
+    thr_note = "using fitted thresholds" if thresholds else "using default 0.5 thresholds"
 
     with gr.Blocks(
         title="Thoracic Disease Classifier",
@@ -177,7 +222,7 @@ def create_app(model, cfg, device):
         gr.Markdown(
             "# 🫁 Thoracic Disease Classification System\n"
             "### ResNet50 + Vision Mamba Hybrid | NIH ChestX-ray14\n"
-            "*Upload a chest X-ray to get AI-assisted disease predictions with "
+            f"*Upload a chest X-ray to get AI-assisted disease predictions ({thr_note}) with "
             "Grad-CAM++ heatmaps, confidence scores, and localization.*\n\n"
             "> ⚠️ **Disclaimer**: This is a research prototype for decision support only. "
             "Not a clinical diagnostic tool."
@@ -229,8 +274,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[demo] Device: {device}")
 
-    model, cfg = load_model(args.config, args.checkpoint, device)
-    app = create_app(model, cfg, device)
+    model, cfg, thresholds = load_model(args.config, args.checkpoint, device)
+    app = create_app(model, cfg, device, thresholds)
     app.launch(server_port=args.port, share=args.share)
 
 

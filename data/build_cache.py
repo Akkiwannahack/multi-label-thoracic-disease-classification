@@ -4,19 +4,19 @@ build_cache.py — Pre-compute enhanced images to an on-disk memmap cache.
 Stores a single-channel (grayscale) uint8 memmap of shape (N, H, W) plus a
 cache_index.csv that maps image_path → row index.
 
+Fix G: cache_meta.json with fingerprint, allocated shape, completed rows.
+       Reuse only on fingerprint match.
+
 Usage:
     python -m data.build_cache --config configs/base.yaml [--workers 8]
-
-The cache is resumable: images whose row already exists in cache_index.csv
-are skipped on re-run.
 """
 
 import argparse
 import csv
+import json
 import multiprocessing as mp
 import os
 import sys
-from functools import partial
 from pathlib import Path
 
 import cv2
@@ -25,7 +25,11 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
-from data.enhancement import enhance_image
+from data.enhancement import (
+    enhance_image,
+    get_enhancement_kwargs,
+    compute_preprocessing_fingerprint,
+)
 
 
 # ── Worker function (top-level for pickling on Windows) ──────────────
@@ -73,21 +77,34 @@ def _process_one_wrapper(args):
 # ── Main ─────────────────────────────────────────────────────────────
 
 def build_cache(cfg: dict, workers: int = 8) -> None:
-    enh = cfg["enhancement"]
-    image_size = enh["image_size"]
-    enh_kwargs = dict(
-        image_size=image_size,
-        clahe_clip=enh["clahe_clip_limit"],
-        clahe_tile=tuple(enh["clahe_tile_grid"]),
-        bilateral_d=enh["bilateral_d"],
-        bilateral_sc=enh["bilateral_sigma_color"],
-        bilateral_ss=enh["bilateral_sigma_space"],
-        sharpen_amount=enh["sharpen_amount"],
-    )
+    enh_kwargs = get_enhancement_kwargs(cfg)
+    image_size = enh_kwargs["image_size"]
+
+    # Fix G: compute fingerprint
+    fingerprint = compute_preprocessing_fingerprint(enh_kwargs)
+    print(f"[cache] Preprocessing fingerprint: {fingerprint}")
 
     manifest_dir = cfg["paths"]["manifest_dir"]
     cache_dir = os.path.join(cfg["paths"]["output_dir"], "cache")
     os.makedirs(cache_dir, exist_ok=True)
+
+    # ── Check for existing cache with different fingerprint ──────
+    meta_path = os.path.join(cache_dir, "cache_meta.json")
+    if os.path.isfile(meta_path):
+        with open(meta_path, "r") as f:
+            old_meta = json.load(f)
+        old_fp = old_meta.get("fingerprint", "")
+        if old_fp != fingerprint:
+            print(
+                f"[cache] WARNING: Existing cache has fingerprint '{old_fp}' "
+                f"but current config produces '{fingerprint}'. "
+                f"The old cache will NOT be reused. "
+                f"Use a different cache directory or rebuild."
+            )
+            # Create a new subdirectory for this fingerprint
+            cache_dir = os.path.join(cache_dir, f"fp_{fingerprint}")
+            os.makedirs(cache_dir, exist_ok=True)
+            print(f"[cache] Using new cache dir: {cache_dir}")
 
     # ── Collect unique image paths across all splits ──────────────
     import pandas as pd
@@ -142,6 +159,9 @@ def build_cache(cfg: dict, workers: int = 8) -> None:
 
     if len(assignments) == 0:
         print("[cache] Nothing to do — cache is already complete.")
+        # Still update metadata
+        _save_meta(meta_path, fingerprint, total_rows,
+                   len(existing), image_size, enh_kwargs)
         return
 
     # ── Create / extend memmap file ───────────────────────────────
@@ -163,10 +183,14 @@ def build_cache(cfg: dict, workers: int = 8) -> None:
     print(f"[cache] Memmap size: {cache_size_gb:.2f} GB  ({mmap_path})")
 
     # ── Process images in parallel ────────────────────────────────
-    # Prepare (image_path, row_idx, mmap_path, image_size, enh_kwargs) args
-    tasks = [(path, row_idx, mmap_path, image_size, enh_kwargs) for row_idx, path in assignments]
+    # Strip imagenet_mean/std from enh_kwargs since we pass normalize=False
+    cache_enh_kwargs = {k: v for k, v in enh_kwargs.items()
+                        if k not in ("imagenet_mean", "imagenet_std")}
+    tasks = [(path, row_idx, mmap_path, image_size, cache_enh_kwargs)
+             for row_idx, path in assignments]
 
     failed = []
+    completed = 0
     # Write index incrementally so a crash doesn't lose progress
     write_header = not os.path.isfile(index_path)
     index_f = open(index_path, "a", newline="")
@@ -183,6 +207,7 @@ def build_cache(cfg: dict, workers: int = 8) -> None:
                 pbar.update(1)
                 if ok:
                     writer.writerow({"image_path": image_path, "row": row_idx})
+                    completed += 1
                 else:
                     failed.append(image_path)
 
@@ -195,9 +220,32 @@ def build_cache(cfg: dict, workers: int = 8) -> None:
         index_f.flush()
         index_f.close()
 
-    print(f"\n[cache] Done. {len(tasks) - len(failed)} succeeded, {len(failed)} failed.")
+    print(f"\n[cache] Done. {completed} succeeded, {len(failed)} failed.")
     if failed:
         print(f"[cache] Failed images: {failed[:10]}{'...' if len(failed) > 10 else ''}")
+
+    # --- Fix G: save metadata ---
+    _save_meta(meta_path, fingerprint, total_rows,
+               len(existing) + completed, image_size, enh_kwargs)
+
+
+def _save_meta(meta_path, fingerprint, allocated_rows, completed_rows,
+               image_size, enh_kwargs):
+    """Save cache_meta.json with fingerprint and allocation info."""
+    meta = {
+        "fingerprint": fingerprint,
+        "allocated_rows": allocated_rows,
+        "completed_rows": completed_rows,
+        "image_size": image_size,
+        "dtype": "uint8",
+        "enhancement_params": {
+            k: v for k, v in enh_kwargs.items()
+            if k not in ("imagenet_mean", "imagenet_std")
+        },
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[cache] Saved cache metadata → {meta_path}")
 
 
 if __name__ == "__main__":

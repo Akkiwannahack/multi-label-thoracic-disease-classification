@@ -9,6 +9,11 @@ Two backends:
   2. Pure-PyTorch fallback — numerically equivalent, works everywhere.
 
 Both expose the same `VisionMambaBlock` interface.
+
+Residual fusion revisions:
+  - legacy_sum: original behaviour — y = fwd + bwd  (each includes its own
+    residual, so the skip connection is applied twice: y ≈ 2x + updates).
+  - mean_v2: corrected — y = x + 0.5 * (fwd_update + bwd_update).
 """
 
 import math
@@ -19,7 +24,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 # ---------------------------------------------------------------------------
-# Try importing the compiled mamba-ssm package; fall back to pure PyTorch
+# Try importing the compiled mamba-ssm package; availability checked later
 # ---------------------------------------------------------------------------
 MAMBA_SSM_AVAILABLE = False
 try:
@@ -27,6 +32,12 @@ try:
     MAMBA_SSM_AVAILABLE = True
 except ImportError:
     pass
+
+# Valid residual fusion modes
+VALID_FUSION_MODES = ("legacy_sum", "mean_v2")
+
+# Valid backend identifiers
+VALID_BACKENDS = ("custom_pytorch", "mamba_ssm")
 
 
 # ========================== Pure-PyTorch SSM ================================
@@ -177,15 +188,33 @@ class CUDAMambaBlock(nn.Module):
 # ========================= Bidirectional wrapper =============================
 
 class BidirectionalMambaBlock(nn.Module):
-    """Bidirectional Mamba: forward scan + backward scan, summed.
+    """Bidirectional Mamba: forward scan + backward scan.
 
     Images have no natural left-to-right causality, so bidirectional
     scanning captures context from all spatial directions.
+
+    Residual fusion modes:
+        legacy_sum — y = fwd + bwd  (original, residual applied twice)
+        mean_v2    — y = x + 0.5 * ((fwd - x) + (bwd - x))
+                       = x + 0.5 * (fwd + bwd - 2x)
     """
 
-    def __init__(self, d_model: int, d_state: int = 16, expand: int = 2,
-                 use_cuda: bool | None = None):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        expand: int = 2,
+        use_cuda: bool | None = None,
+        residual_fusion: str = "mean_v2",
+    ):
         super().__init__()
+
+        if residual_fusion not in VALID_FUSION_MODES:
+            raise ValueError(
+                f"Unknown residual_fusion '{residual_fusion}'. "
+                f"Valid: {VALID_FUSION_MODES}"
+            )
+        self.residual_fusion = residual_fusion
 
         if use_cuda is None:
             use_cuda = MAMBA_SSM_AVAILABLE
@@ -200,11 +229,18 @@ class BidirectionalMambaBlock(nn.Module):
         Args:
             x: (B, L, D)
         Returns:
-            (B, L, D) — sum of forward and backward scans
+            (B, L, D)
         """
         fwd = self.forward_block(x)
         bwd = self.backward_block(x.flip(dims=[1])).flip(dims=[1])
-        return fwd + bwd
+
+        if self.residual_fusion == "legacy_sum":
+            # Original behaviour: y = fwd + bwd (residual applied twice)
+            return fwd + bwd
+        else:
+            # mean_v2: y = x + 0.5 * (fwd_update + bwd_update)
+            # where fwd_update = fwd - x, bwd_update = bwd - x
+            return x + 0.5 * (fwd + bwd - 2 * x)
 
 
 # ======================== Vision Mamba Encoder ===============================
@@ -224,11 +260,13 @@ class VisionMambaEncoder(nn.Module):
         d_state: int = 16,
         num_blocks: int = 4,
         use_cuda: bool | None = None,
+        residual_fusion: str = "mean_v2",
     ):
         super().__init__()
         self.spatial_size = spatial_size
         self.num_tokens = spatial_size * spatial_size  # 49 for 7×7
         self.d_model = d_model
+        self.residual_fusion = residual_fusion
 
         # Project from ResNet channel dim to SSM working dim
         self.input_proj = nn.Linear(in_channels, d_model)
@@ -240,7 +278,11 @@ class VisionMambaEncoder(nn.Module):
 
         # Stack of bidirectional Mamba blocks
         self.blocks = nn.ModuleList([
-            BidirectionalMambaBlock(d_model, d_state, use_cuda=use_cuda)
+            BidirectionalMambaBlock(
+                d_model, d_state,
+                use_cuda=use_cuda,
+                residual_fusion=residual_fusion,
+            )
             for _ in range(num_blocks)
         ])
 
@@ -255,6 +297,16 @@ class VisionMambaEncoder(nn.Module):
             Global context vector (B, d_model) — mean-pooled over tokens
         """
         B, C, H, W = feature_map.shape
+
+        # --- Fix I: Shape guard ---
+        num_tokens = H * W
+        if num_tokens != self.num_tokens:
+            raise ValueError(
+                f"Spatial size mismatch: positional embedding expects "
+                f"{self.spatial_size}×{self.spatial_size} = {self.num_tokens} tokens, "
+                f"but feature map has {H}×{W} = {num_tokens} tokens. "
+                f"This model only supports image_size=224 (producing 7×7 features)."
+            )
 
         # Flatten spatial dims → token sequence
         tokens = rearrange(feature_map, "b c h w -> b (h w) c")  # (B, 49, 2048)
@@ -275,3 +327,29 @@ class VisionMambaEncoder(nn.Module):
         context = tokens.mean(dim=1)  # (B, d_model)
 
         return context
+
+
+def resolve_backend(requested: str) -> bool:
+    """Resolve a backend string to a use_cuda boolean.
+
+    Args:
+        requested: one of VALID_BACKENDS
+
+    Returns:
+        True for mamba_ssm, False for custom_pytorch
+
+    Raises:
+        ValueError for unknown or unavailable backends.
+    """
+    if requested not in VALID_BACKENDS:
+        raise ValueError(
+            f"Unknown mamba_backend '{requested}'. Valid: {VALID_BACKENDS}"
+        )
+    if requested == "mamba_ssm":
+        if not MAMBA_SSM_AVAILABLE:
+            raise RuntimeError(
+                "mamba_backend='mamba_ssm' requested but mamba_ssm package "
+                "is not installed. Install it or use 'custom_pytorch'."
+            )
+        return True
+    return False

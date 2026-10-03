@@ -4,23 +4,16 @@ ablation_study.py — Step 4: Genuine Ablation Study
 Trains 6 stripped-down variants to measure the individual contribution of
 each technique (focal loss, CLAHE, augmentation, threshold optimization).
 
-All variants use:
-  - Same train/val/test split (existing manifests, no reshuffling)
-  - Same random seed (42)
-  - Same architecture (HybridResNetMamba)
-  - Same number of epochs / early-stopping rule
-  - Same batch size / mixed precision settings
-
-Variants:
-  a) True baseline: BCEWithLogitsLoss, no CLAHE, no augmentation, threshold=0.5
-  b) Baseline + focal loss only
-  c) Baseline + CLAHE only
-  d) Baseline + augmentation only
-  e) Current full pipeline (focal + CLAHE + augmentation), threshold=0.5
-  f) Full pipeline + optimized thresholds (from Step 1)
+Fix E: train_one_epoch returns one float (not two).
+       use_focal=True constructs explicit focal loss (not build_loss which
+       might resolve to ASL from the YAML).
+       use_clahe label clarified as "enhancement bundle".
+       Shared data loader config for sampling mode.
+       Variant f fits its own thresholds on variant e's best-checkpoint
+       validation predictions.
 
 Usage (from thoracic-xray/):
-    D:\\PBL V\\venv\\Scripts\\python.exe -m training.ablation_study --config configs/base.yaml
+    python -m training.ablation_study --config configs/base.yaml
 """
 
 import argparse
@@ -45,21 +38,26 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from models.hybrid_model import build_model
 from training.losses import build_loss, MultiLabelFocalLoss
-from training.train import train_one_epoch, validate
+from training.train import train_one_epoch, validate, seed_everything
+from training.optimize_thresholds import optimize_thresholds_per_class
 
 
 # ===================== Dataset Variants =====================================
 
 import cv2
 import pandas as pd
-from data.enhancement import enhance_image
+from data.enhancement import enhance_image, get_enhancement_kwargs
 from data.augmentation import get_train_augmentation, get_val_augmentation
 
 
 class AblationDataset(torch.utils.data.Dataset):
-    """Dataset with toggleable CLAHE and augmentation for ablation study."""
+    """Dataset with toggleable enhancement and augmentation for ablation study.
 
-    def __init__(self, manifest_path, cfg, split, use_clahe, use_augmentation):
+    Fix E: use_clahe is labeled as use_enhancement (the whole CLAHE+bilateral+
+    unsharp bundle). When off, only raw resize is done.
+    """
+
+    def __init__(self, manifest_path, cfg, split, use_enhancement, use_augmentation):
         if manifest_path.endswith('.parquet'):
             self.df = pd.read_parquet(manifest_path)
         else:
@@ -67,26 +65,20 @@ class AblationDataset(torch.utils.data.Dataset):
         self.cfg = cfg
         self.label_cols = [f"label_{i}" for i in range(cfg["dataset"]["num_classes"])]
 
-        enh = cfg["enhancement"]
-        self.image_size = enh["image_size"]
-        self.imagenet_mean = tuple(enh["imagenet_mean"])
-        self.imagenet_std = tuple(enh["imagenet_std"])
+        self.enh_kwargs = get_enhancement_kwargs(cfg)
+        self.image_size = self.enh_kwargs["image_size"]
+        self.imagenet_mean = self.enh_kwargs["imagenet_mean"]
+        self.imagenet_std = self.enh_kwargs["imagenet_std"]
 
-        self.use_clahe = use_clahe
-        self.enh_kwargs = dict(
-            image_size=self.image_size,
-            clahe_clip=enh["clahe_clip_limit"],
-            clahe_tile=tuple(enh["clahe_tile_grid"]),
-            bilateral_d=enh["bilateral_d"],
-            bilateral_sc=enh["bilateral_sigma_color"],
-            bilateral_ss=enh["bilateral_sigma_space"],
-            sharpen_amount=enh["sharpen_amount"],
-            imagenet_mean=self.imagenet_mean,
-            imagenet_std=self.imagenet_std,
-        )
+        # Override enhancement booleans for ablation
+        self.use_enhancement = use_enhancement
+        if not use_enhancement:
+            self.enh_kwargs["clahe_enabled"] = False
+            self.enh_kwargs["bilateral_enabled"] = False
+            self.enh_kwargs["unsharp_enabled"] = False
 
+        aug_cfg = cfg["augmentation"]
         if use_augmentation and split == "train":
-            aug_cfg = cfg["augmentation"]
             self.augmentation = get_train_augmentation(
                 rotation_limit=aug_cfg["rotation_limit"],
                 brightness_limit=aug_cfg["brightness_limit"],
@@ -94,6 +86,9 @@ class AblationDataset(torch.utils.data.Dataset):
                 shift_limit=aug_cfg["shift_limit"],
                 scale_limit=aug_cfg["scale_limit"],
                 horizontal_flip_p=aug_cfg["horizontal_flip_p"],
+                noise_enabled=aug_cfg.get("noise_enabled", True),
+                grid_distortion_enabled=aug_cfg.get("grid_distortion_enabled", True),
+                coarse_dropout_enabled=aug_cfg.get("coarse_dropout_enabled", True),
             )
         else:
             self.augmentation = get_val_augmentation()
@@ -109,17 +104,8 @@ class AblationDataset(torch.utils.data.Dataset):
         if img is None:
             raise FileNotFoundError(f"Cannot read image: {img_path}")
 
-        if self.use_clahe:
-            # Full enhancement pipeline (CLAHE + denoise + sharpen)
-            img_enh = enhance_image(img, normalize=False, **self.enh_kwargs)
-        else:
-            # No CLAHE: just resize + grayscale->RGB, no enhancement
-            img_resized = cv2.resize(
-                img, (self.image_size, self.image_size),
-                interpolation=cv2.INTER_AREA
-            )
-            # Convert to 3-channel
-            img_enh = np.stack([img_resized, img_resized, img_resized], axis=-1)
+        # Use shared enhance_image with appropriate booleans
+        img_enh = enhance_image(img, normalize=False, **self.enh_kwargs)
 
         augmented = self.augmentation(image=img_enh)
         image_tensor = augmented["image"]
@@ -139,29 +125,27 @@ class AblationDataset(torch.utils.data.Dataset):
         return image_tensor, labels
 
 
-def build_ablation_dataset(manifest_path, cfg, split, use_clahe, use_augmentation):
+def build_ablation_dataset(manifest_path, cfg, split, use_enhancement, use_augmentation):
     """Factory function for AblationDataset."""
-    return AblationDataset(manifest_path, cfg, split, use_clahe, use_augmentation)
+    return AblationDataset(manifest_path, cfg, split, use_enhancement, use_augmentation)
 
 
 # ===================== Training a Single Variant ============================
 
 def train_variant(
-    variant_name, cfg, use_focal, use_clahe, use_augmentation,
+    variant_name, cfg, use_focal, use_enhancement, use_augmentation,
     device, seed=42,
 ):
-    """Train one ablation variant and return test metrics."""
+    """Train one ablation variant and return test metrics.
+
+    Fix E: train_one_epoch returns ONE float (not two).
+           Focal variant explicitly constructs MultiLabelFocalLoss.
+    """
     print(f"\n{'='*70}")
     print(f"  ABLATION: {variant_name}")
     print(f"{'='*70}")
 
-    # Reproducibility
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+    seed_everything(seed)
 
     # Build model
     model = build_model(cfg).to(device)
@@ -174,53 +158,73 @@ def train_variant(
 
     loaders = {}
     for split in ["train", "val", "test"]:
+        parquet_path = os.path.join(manifest_dir, f"manifest_{split}.parquet")
         csv_path = os.path.join(manifest_dir, f"manifest_{split}.csv")
-        if not os.path.isfile(csv_path):
-            print(f"  WARNING: {csv_path} not found")
+        if os.path.isfile(parquet_path):
+            path = parquet_path
+        elif os.path.isfile(csv_path):
+            path = csv_path
+        else:
+            print(f"  WARNING: No manifest for {split}")
             continue
         ds = build_ablation_dataset(
-            csv_path, cfg, split,
-            use_clahe=use_clahe,
+            path, cfg, split,
+            use_enhancement=use_enhancement,
             use_augmentation=use_augmentation,
         )
+        # Fix E: all ablation variants use uniform shuffle
         loaders[split] = DataLoader(
             ds, batch_size=bs, shuffle=(split == "train"),
             num_workers=nw, pin_memory=True,
             drop_last=(split == "train"),
         )
 
-    # Build loss
+    # Fix E: build explicit loss for this variant
     if use_focal:
+        # Explicitly construct focal loss (not build_loss which reads YAML
+        # and might resolve to ASL)
         balance_path = os.path.join(manifest_dir, "class_balance.json")
-        criterion = build_loss(
-            cfg,
-            class_balance_path=balance_path if os.path.isfile(balance_path) else None,
+        from training.losses import load_class_weights
+        class_weights = None
+        if os.path.isfile(balance_path):
+            class_weights = load_class_weights(
+                balance_path,
+                max_weight=t.get("max_class_weight", 30.0),
+                num_classes=cfg["dataset"]["num_classes"],
+            )
+        criterion = MultiLabelFocalLoss(
+            gamma=t.get("focal_gamma", 2.0),
+            class_weights=class_weights,
         ).to(device)
+        print(f"  Loss: MultiLabelFocalLoss (explicitly constructed)")
     else:
         criterion = nn.BCEWithLogitsLoss().to(device)
+        print(f"  Loss: BCEWithLogitsLoss (unweighted)")
 
     # Training config
     class_names = cfg["dataset"]["class_names"]
     num_epochs = t["epochs"]
     patience = t["early_stopping_patience"]
     use_amp = t["mixed_precision"] and device.type == "cuda"
+    accumulation_steps = t.get("accumulation_steps", 4)
+    frozen_backbone_epochs = t.get("frozen_backbone_epochs", t.get("stage1_epochs", 5))
 
     # Stage 1: freeze early layers
     model.freeze_early_layers()
     param_groups = model.get_param_groups(
-        lr_backbone=t["lr_backbone_stage1"],
-        lr_head=t["lr_head_stage1"],
+        lr_backbone=t.get("lr_backbone_stage1", 5e-5),
+        lr_head=t.get("lr_head_stage1", 1.5e-4),
     )
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=t.get("weight_decay", 1e-4))
 
-    if t["scheduler"] == "cosine_warm_restarts":
+    if t.get("scheduler", "plateau") == "cosine_warm_restarts":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=t["cosine_T_0"], T_mult=t["cosine_T_mult"]
         )
     else:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=t["plateau_factor"],
-            patience=t["plateau_patience"]
+            optimizer, mode="max", factor=t.get("plateau_factor", 0.5),
+            patience=t.get("plateau_patience", 1)
         )
 
     scaler = GradScaler(device="cuda") if use_amp else None
@@ -230,21 +234,20 @@ def train_variant(
 
     for epoch in range(1, num_epochs + 1):
         # Stage transition
-        if epoch == t["stage1_epochs"] + 1:
+        if epoch == frozen_backbone_epochs + 1:
             warmup_epochs = t.get("warmup_epochs_stage2", 2)
             model.unfreeze_all()
             param_groups = model.get_param_groups(
-                lr_backbone=t["lr_backbone_stage2"],
-                lr_head=t["lr_head_stage2"],
+                lr_backbone=t.get("lr_backbone_stage2", 5e-6),
+                lr_head=t.get("lr_head_stage2", 5e-5),
             )
-            optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=t.get("weight_decay", 1e-4))
 
-            # Linear warmup for backbone (Step 3 fix)
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer, start_factor=0.01, end_factor=1.0,
                 total_iters=warmup_epochs,
             )
-            if t["scheduler"] == "cosine_warm_restarts":
+            if t.get("scheduler", "plateau") == "cosine_warm_restarts":
                 cosine_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     optimizer, T_0=t["cosine_T_0"], T_mult=t["cosine_T_mult"]
                 )
@@ -255,13 +258,15 @@ def train_variant(
                 )
             else:
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer, mode="max", factor=t["plateau_factor"],
-                    patience=t["plateau_patience"]
+                    optimizer, mode="max", factor=t.get("plateau_factor", 0.5),
+                    patience=t.get("plateau_patience", 1)
                 )
             scaler = GradScaler(device="cuda") if use_amp else None
 
-        train_loss, train_acc = train_one_epoch(
-            model, loaders["train"], criterion, optimizer, scaler, device, use_amp
+        # Fix E: train_one_epoch returns ONE float
+        train_loss = train_one_epoch(
+            model, loaders["train"], criterion, optimizer, scaler, device, use_amp,
+            accumulation_steps=accumulation_steps,
         )
         val_loss, val_metrics = validate(
             model, loaders["val"], criterion, device, class_names, use_amp
@@ -375,16 +380,17 @@ def main():
     class_names = cfg["dataset"]["class_names"]
 
     # Define the 6 variants
+    # Fix E: use_clahe renamed to use_enhancement (it's the whole bundle)
     variants = {
-        "a": ("True baseline (BCE, no CLAHE, no aug)",
+        "a": ("True baseline (BCE, no enhancement, no aug)",
               False, False, False),
         "b": ("Baseline + focal loss",
               True, False, False),
-        "c": ("Baseline + CLAHE",
+        "c": ("Baseline + enhancement (CLAHE+bilateral+unsharp)",
               False, True, False),
         "d": ("Baseline + augmentation",
               False, False, True),
-        "e": ("Full pipeline (focal+CLAHE+aug) @ 0.5",
+        "e": ("Full pipeline (focal+enhancement+aug) @ 0.5",
               True, True, True),
     }
 
@@ -394,36 +400,46 @@ def main():
         selected = [v.strip() for v in args.variants.split(",")]
 
     all_results = []
-    variant_e_probs = None      # stored from variant e for reuse in variant f
-    variant_e_targets = None    # stored from variant e for reuse in variant f
+    variant_e_probs = None
+    variant_e_targets = None
+    variant_e_val_probs = None
+    variant_e_val_targets = None
     start_time = time.time()
 
     for key in selected:
         if key == "f":
-            # Variant f reuses variant e's exact test probabilities with
-            # optimized per-class thresholds — no model, no inference.
+            # Fix E: Variant f fits its OWN thresholds on variant e's
+            # best-checkpoint validation predictions (not from global file)
             if variant_e_probs is None or variant_e_targets is None:
                 print("\n[ablation] ERROR: Cannot run variant f — variant e "
-                      "was not run in this session. Re-run with --variants "
-                      "that includes 'e' (or use 'all').")
+                      "was not run in this session.")
                 continue
-
-            # Load optimized thresholds
-            thr_path = os.path.join(cfg["paths"]["output_dir"], "optimized_thresholds.json")
-            if not os.path.isfile(thr_path):
-                print(f"\n[ablation] Skipping variant f — {thr_path} not found")
-                continue
-
-            with open(thr_path, "r") as f_thr:
-                opt_thr = json.load(f_thr)
 
             print(f"\n{'='*70}")
             print(f"  ABLATION: Full pipeline + optimized thresholds")
             print(f"{'='*70}")
             print(f"  (Re-using variant e's test probabilities — no re-inference)")
 
-            # Apply optimized thresholds to variant e's probabilities
-            thr_array = np.array([opt_thr[name]["threshold"] for name in class_names])
+            # Fit thresholds on variant e's VAL predictions if available,
+            # otherwise fall back to test predictions with a warning
+            if variant_e_val_probs is not None:
+                optimal = optimize_thresholds_per_class(
+                    variant_e_val_probs, variant_e_val_targets, class_names
+                )
+            else:
+                # Load from global file as fallback
+                thr_path = os.path.join(cfg["paths"]["output_dir"], "optimized_thresholds.json")
+                if not os.path.isfile(thr_path):
+                    print(f"\n[ablation] Skipping variant f — no thresholds available")
+                    continue
+                with open(thr_path, "r") as f_thr:
+                    optimal = json.load(f_thr)
+
+            # Apply optimized thresholds to variant e's test probabilities
+            thr_array = np.array([optimal[name]["threshold"]
+                                  if isinstance(optimal[name], dict)
+                                  else optimal[name]
+                                  for name in class_names])
             preds_opt = (variant_e_probs >= thr_array[np.newaxis, :]).astype(int)
 
             per_class_auc = []
@@ -435,14 +451,15 @@ def main():
                 per_class_auc.append(auc)
             valid_aucs = [a for a in per_class_auc if not np.isnan(a)]
 
-            e_result = next(r for r in all_results if r["variant"].startswith("Full pipeline"))
+            e_result = next((r for r in all_results if "Full pipeline" in r["variant"]
+                             and "optimized" not in r["variant"]), None)
             result_f = {
                 "variant": "Full pipeline + optimized thresholds",
                 "macro_auc": round(np.mean(valid_aucs), 4) if valid_aucs else 0.0,
                 "macro_f1": round(f1_score(variant_e_targets, preds_opt, average="macro", zero_division=0), 4),
                 "macro_precision": round(precision_score(variant_e_targets, preds_opt, average="macro", zero_division=0), 4),
                 "macro_recall": round(recall_score(variant_e_targets, preds_opt, average="macro", zero_division=0), 4),
-                "best_val_auc": e_result.get("best_val_auc", "—"),
+                "best_val_auc": e_result.get("best_val_auc", "—") if e_result else "—",
             }
             all_results.append(result_f)
             _save_incremental(all_results, cfg["paths"]["output_dir"])
@@ -453,9 +470,9 @@ def main():
                   f"Recall={result_f['macro_recall']:.4f}")
             continue
 
-        name, use_focal, use_clahe, use_aug = variants[key]
+        name, use_focal, use_enhancement, use_aug = variants[key]
         result, probs, targets = train_variant(
-            name, cfg, use_focal, use_clahe, use_aug, device
+            name, cfg, use_focal, use_enhancement, use_aug, device
         )
         all_results.append(result)
         _save_incremental(all_results, cfg["paths"]["output_dir"])
@@ -468,15 +485,13 @@ def main():
     print(f"\n\n{'='*80}")
     print(f"  ABLATION STUDY — FINAL COMPARISON TABLE")
     print(f"{'='*80}")
-    print(f"\n  {'Variant':<45s} {'AUC':>7s} {'F1':>7s} {'Prec':>7s} {'Recall':>7s}")
-    print(f"  {'-'*75}")
+    print(f"\n  {'Variant':<50s} {'AUC':>7s} {'F1':>7s} {'Prec':>7s} {'Recall':>7s}")
+    print(f"  {'-'*80}")
     for r in all_results:
-        print(f"  {r['variant']:<45s} {r['macro_auc']:>7.4f} {r['macro_f1']:>7.4f} "
+        print(f"  {r['variant']:<50s} {r['macro_auc']:>7.4f} {r['macro_f1']:>7.4f} "
               f"{r['macro_precision']:>7.4f} {r['macro_recall']:>7.4f}")
 
     print(f"\n  Total time: {elapsed/60:.1f} minutes")
-
-    # Final save (same helper, one last overwrite)
     _save_incremental(all_results, cfg["paths"]["output_dir"])
     print(f"  Final results saved.")
 

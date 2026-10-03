@@ -4,14 +4,18 @@ generate_report.py  -  Phase 9: Diagnostic Report Generation
 Assembles predictions, Grad-CAM++ heatmaps, confidence estimates, and
 localization into a doctor-friendly PDF report.
 
+Fix H: Uses fitted thresholds (not hard-coded 0.5). Reports which
+       thresholds are in use. Full enhancement config from checkpoint.
+
 Usage:
-    python -m reporting.generate_report --config configs/base.yaml \
-        --checkpoint checkpoints/best_model.pt \
-        --image path/to/xray.png \
+    python -m reporting.generate_report --config configs/base.yaml \\
+        --checkpoint checkpoints/best_model.pt \\
+        --image path/to/xray.png \\
         --output outputs/reports/report.pdf
 """
 
 import argparse
+import json
 import os
 import tempfile
 
@@ -21,7 +25,7 @@ import torch
 import yaml
 from fpdf import FPDF
 
-from data.enhancement import enhance_image
+from data.enhancement import enhance_image, get_enhancement_kwargs
 from explainability.confidence import predict_with_confidence
 from explainability.gradcam_pp import generate_heatmap, overlay_heatmap
 from explainability.localization import localize
@@ -79,8 +83,11 @@ def generate_report(
     output_path: str,
     patient_id: str = "Unknown",
     device: torch.device | None = None,
+    thresholds: dict[str, float] | None = None,
 ) -> str:
     """Generate a full diagnostic PDF report for a single X-ray image.
+
+    Fix H: Uses fitted thresholds. Full enhancement config from cfg.
 
     Args:
         image_path: Path to the input chest X-ray image
@@ -89,6 +96,7 @@ def generate_report(
         output_path: Where to save the PDF
         patient_id: Patient identifier
         device: Torch device
+        thresholds: Per-class fitted thresholds (Fix H). If None, uses 0.5.
 
     Returns:
         Path to the generated PDF
@@ -96,7 +104,7 @@ def generate_report(
     if device is None:
         device = next(model.parameters()).device
 
-    enh_cfg = cfg["enhancement"]
+    enh_kwargs = get_enhancement_kwargs(cfg)
     conf_cfg = cfg["confidence"]
     gc_cfg = cfg["gradcam"]
     loc_cfg = cfg["localization"]
@@ -107,15 +115,13 @@ def generate_report(
         raise FileNotFoundError(f"Cannot read image: {image_path}")
 
     # Enhanced (uint8 RGB for visualization)
-    enhanced_rgb = enhance_image(raw_img, normalize=False,
-                                  image_size=enh_cfg["image_size"])
+    enhanced_rgb = enhance_image(raw_img, normalize=False, **enh_kwargs)
 
     # Enhanced (float32 normalized for model input)
-    enhanced_norm = enhance_image(raw_img, normalize=True,
-                                   image_size=enh_cfg["image_size"])
+    enhanced_norm = enhance_image(raw_img, normalize=True, **enh_kwargs)
     image_tensor = torch.from_numpy(enhanced_norm).permute(2, 0, 1).float()
 
-    # --- Predict with confidence ---
+    # --- Predict with confidence (Fix H: uses fitted thresholds) ---
     result = predict_with_confidence(
         model, image_tensor,
         class_names=CLASS_NAMES,
@@ -123,6 +129,7 @@ def generate_report(
         high_threshold=conf_cfg["high_threshold"],
         medium_threshold=conf_cfg["medium_threshold"],
         device=device,
+        thresholds=thresholds,
     )
 
     detected = result["detected_diseases"]
@@ -166,6 +173,14 @@ def generate_report(
     pdf.cell(0, 8, f"Patient ID: {patient_id}", ln=True)
     image_name = os.path.basename(image_path)
     pdf.cell(0, 8, f"Image: {image_name}", ln=True)
+
+    # Fix H: report which thresholds are in use
+    if thresholds:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(0, 6, "Using validation-fitted per-class thresholds.", ln=True)
+    else:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(0, 6, "Using default 0.5 threshold for all classes.", ln=True)
     pdf.ln(5)
 
     # Original vs Enhanced image
@@ -184,7 +199,8 @@ def generate_report(
     # No findings
     if not detected:
         pdf.set_font("Helvetica", "", 11)
-        pdf.cell(0, 8, "No diseases detected (all probabilities below 0.5 threshold).", ln=True)
+        thr_note = "validation-fitted" if thresholds else "0.5"
+        pdf.cell(0, 8, f"No diseases detected (all probabilities below {thr_note} threshold).", ln=True)
         pdf.output(output_path)
         return output_path
 
@@ -248,7 +264,7 @@ def generate_report(
                    "physician before any clinical action is taken.")
 
     pdf.output(output_path)
-    print(f"[report] Saved diagnostic report → {output_path}")
+    print(f"[report] Saved diagnostic report -> {output_path}")
     return output_path
 
 
@@ -259,6 +275,8 @@ def main():
     parser.add_argument("--image", type=str, required=True, help="Path to X-ray image")
     parser.add_argument("--output", type=str, default="outputs/reports/report.pdf")
     parser.add_argument("--patient-id", type=str, default="Unknown")
+    parser.add_argument("--thresholds", type=str, default=None,
+                        help="Path to optimized_thresholds.json")
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -268,13 +286,26 @@ def main():
 
     # Load model
     model = build_model(cfg).to(device)
+    if not os.path.isfile(args.checkpoint):
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
+    # Load thresholds if provided
+    thresholds = None
+    if args.thresholds:
+        with open(args.thresholds, "r") as f:
+            thr_data = json.load(f)
+        thresholds = {}
+        for name in CLASS_NAMES:
+            val = thr_data.get(name, {"threshold": 0.5})
+            thresholds[name] = val["threshold"] if isinstance(val, dict) else val
+
     generate_report(
         args.image, model, cfg, args.output,
         patient_id=args.patient_id, device=device,
+        thresholds=thresholds,
     )
 
 
